@@ -148,26 +148,14 @@ static int get_object(char *buf, char __user *user_object, size_t buf_sz,
 	return 0;
 }
 
-#if ((!defined(KSU_COMPAT_USE_SELINUX_STATE)) || \
-        LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0))
 extern int avc_ss_reset(u32 seqno);
-#else
-extern int avc_ss_reset(struct selinux_avc *avc, u32 seqno);
-#endif
+
 // reset avc cache table, otherwise the new rules will not take effect if already denied
 static void reset_avc_cache()
 {
-#if ((!defined(KSU_COMPAT_USE_SELINUX_STATE)) || \
-        LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0))
 	avc_ss_reset(0);
 	selnl_notify_policyload(0);
 	selinux_status_update_policyload(0);
-#else
-	struct selinux_avc *avc = selinux_state.avc;
-	avc_ss_reset(avc, 0);
-	selnl_notify_policyload(0);
-	selinux_status_update_policyload(&selinux_state, 0);
-#endif
 	selinux_xfrm_notify_policyload();
 }
 
