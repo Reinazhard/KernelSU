@@ -98,8 +98,8 @@ static int do_report_event(void __user *arg)
     switch (cmd.event) {
     case EVENT_POST_FS_DATA: {
         static bool post_fs_data_lock = false;
-        if (!post_fs_data_lock) {
-            post_fs_data_lock = true;
+        /* Use cmpxchg to prevent double-execution from concurrent callers */
+        if (cmpxchg(&post_fs_data_lock, false, true) == false) {
             pr_info("post-fs-data triggered\n");
             on_post_fs_data();
         }
@@ -107,8 +107,8 @@ static int do_report_event(void __user *arg)
     }
     case EVENT_BOOT_COMPLETED: {
         static bool boot_complete_lock = false;
-        if (!boot_complete_lock) {
-            boot_complete_lock = true;
+        /* Use cmpxchg to prevent double-execution from concurrent callers */
+        if (cmpxchg(&boot_complete_lock, false, true) == false) {
             pr_info("boot_complete triggered\n");
             on_boot_completed();
             susfs_start_sdcard_monitor_fn();
@@ -180,13 +180,17 @@ static int do_new_get_allow_list_common(void __user *arg, bool allow)
         goto out;
     }
 
+    /* Save the user pointer before the first copy — the user could race
+     * and change the uids field between the two copy_to_user calls. */
+    int __user *uids_dst = (int __user *)&((struct ksu_new_get_allow_list_cmd *)arg)->uids;
+
     if (copy_to_user(arg, &cmd, sizeof(cmd))) {
         pr_err("new_get_allow_list: copy_to_user count failed\n");
         err = -EFAULT;
         goto out;
     }
 
-    if (cmd.count && copy_to_user(&((struct ksu_new_get_allow_list_cmd *)arg)->uids, arr, sizeof(int) * cmd.count)) {
+    if (cmd.count && copy_to_user(uids_dst, arr, sizeof(int) * cmd.count)) {
         pr_err("new_get_allow_list: copy_to_user uids failed\n");
         err = -EFAULT;
     }
@@ -325,8 +329,8 @@ static int do_get_app_profile(void __user *arg)
 
     rcu_read_lock();
     profile = ksu_get_app_profile(uid);
-    rcu_read_unlock();
     if (!profile) {
+        rcu_read_unlock();
         ret = -ENOENT;
     } else {
         if (copy_to_user((char __user *)arg + offsetof(struct ksu_get_app_profile_cmd, profile), profile,
@@ -334,6 +338,7 @@ static int do_get_app_profile(void __user *arg)
             pr_err("get_app_profile: copy_to_user failed\n");
             ret = -EFAULT;
         }
+        rcu_read_unlock();
         ksu_put_app_profile(profile);
     }
     return ret;
