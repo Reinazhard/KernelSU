@@ -73,13 +73,15 @@ void ksu_syscall_table_hook(int nr, syscall_fn_t fn, syscall_fn_t *old)
         }
     }
     if (!found) {
-        if (hooked_count < ARRAY_SIZE(hooked_entries)) {
-            hooked_entries[hooked_count].nr = nr;
-            hooked_entries[hooked_count].orig = orig;
-            hooked_count++;
-        } else {
-            pr_warn("hooked_entries full, cannot track syscall %d for restoration\n", nr);
+        if (hooked_count >= ARRAY_SIZE(hooked_entries)) {
+            pr_err("hooked_entries full (%d), refusing to hook syscall %d — would leave orphaned hook on unload\n",
+                   (int)ARRAY_SIZE(hooked_entries), nr);
+            mutex_unlock(&hooked_entries_lock);
+            return;
         }
+        hooked_entries[hooked_count].nr = nr;
+        hooked_entries[hooked_count].orig = orig;
+        hooked_count++;
     }
 
     patch_syscall_table(nr, fn);

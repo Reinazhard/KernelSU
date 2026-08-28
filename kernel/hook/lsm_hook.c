@@ -426,10 +426,11 @@ void ksu_lsm_unhook(struct ksu_lsm_hook *hook)
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
     if (ksu_lsm_hook_update_scall(hook->scall, hook->original)) {
-        if (ksu_lsm_hook_patch_slot(slot, hook->replacement))
-            pr_err("lsm_hook: failed to reapply %s after static call restore failure\n", hook->head_name ?: "unknown");
-        mutex_unlock(&ksu_lsm_hook_lock);
-        return;
+        pr_err("lsm_hook: CRITICAL: failed to restore %s static call — slot has original but scall still points to replacement\n",
+               hook->head_name ?: "unknown");
+        /* Best-effort: disable the static call to prevent reaching stale code */
+        __static_call_update(hook->scall->key, hook->scall->trampoline, hook->original);
+        smp_wmb();
     }
 #endif
 
