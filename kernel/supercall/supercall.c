@@ -119,7 +119,7 @@ int ksu_supercall_reboot_handler(void __user **arg)
 
     tw = kzalloc(sizeof(*tw), GFP_KERNEL);
     if (!tw)
-        return 0;
+        return -ENOMEM;
 
     tw->outp = (int __user *)(*arg);
     tw->cb.func = ksu_install_fd_tw_func;
