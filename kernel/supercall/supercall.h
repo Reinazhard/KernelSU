@@ -18,7 +18,10 @@ struct ksu_ioctl_cmd_map {
 
 // Install KSU fd to current process
 int ksu_install_fd(void);
+// Handed to a process that has just exec'd into ksud; called from fs/exec.c.
+int ksu_install_su_fd(void);
 
 void ksu_supercalls_init(void);
 void ksu_supercalls_exit(void);
+int ksu_supercall_reboot_handler(void __user **arg);
 #endif // __KSU_H_SUPERCALL

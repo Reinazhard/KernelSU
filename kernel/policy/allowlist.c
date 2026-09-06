@@ -295,10 +295,7 @@ bool ksu_uid_should_umount(uid_t uid)
 {
     struct app_profile *profile;
     bool res;
-    if (likely(ksu_is_manager_appid_valid()) && unlikely(ksu_get_manager_appid() == uid % PER_USER_RANGE)) {
-        // we should not umount on manager!
-        return false;
-    }
+
     if (unlikely(uid == WEBVIEW_ZYGOTE_UID)) {
         return ksu_webview_zygote_umount_enabled;
     }
