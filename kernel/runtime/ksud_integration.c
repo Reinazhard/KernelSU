@@ -11,6 +11,7 @@
 #include <linux/fs.h>
 #include <linux/version.h>
 #include <linux/input-event-codes.h>
+#include <linux/input.h>
 #include <linux/printk.h>
 #include <linux/types.h>
 #include <linux/uaccess.h>
@@ -27,7 +28,6 @@
 #include "selinux/selinux.h"
 
 DEFINE_STATIC_KEY_TRUE(ksu_is_init_rc_hook_enabled);
-DEFINE_STATIC_KEY_TRUE(ksu_is_input_hook_enabled);
 DEFINE_STATIC_KEY_TRUE(is_init_second_stage_not_executed);
 DEFINE_STATIC_KEY_TRUE(is_first_zygote);
 
@@ -422,7 +422,7 @@ static bool is_init_rc(struct file *fp)
     return true;
 }
 
-static void ksu_install_rc_hook(struct file *file)
+void ksu_install_rc_hook(struct file *file)
 {
     if (!is_init_rc(file)) {
         return;
@@ -464,74 +464,167 @@ static void ksu_install_rc_hook(struct file *file)
     file->f_op = &fops_proxy;
 }
 
-void ksu_handle_sys_read(unsigned int fd, char __user **buf_ptr, size_t *count_ptr)
+/*
+ * init.rc injection, reached from the file_permission hook instead of sys_read.
+ * The static key is switched off as soon as the first read is hooked, so this is
+ * free for the rest of the boot.
+ */
+int ksu_file_permission(struct file *file, int mask)
 {
-    struct file *file = fget(fd);
-    if (!file) {
-        return;
-    }
-    ksu_install_rc_hook(file);
-    fput(file);
-}
-
-static unsigned int volumedown_pressed_count = 0;
-
-static bool is_volumedown_enough(unsigned int count)
-{
-    return count >= 3;
-}
-
-int ksu_handle_input_handle_event(unsigned int *type, unsigned int *code, int *value)
-{
-    if (*type == EV_KEY && *code == KEY_VOLUMEDOWN) {
-        int val = *value;
-        pr_info("KEY_VOLUMEDOWN val: %d\n", val);
-        if (val) {
-            // - We cannot call static_branch_disable() here as we are within the
-            //   spinlock section, which is not sleepable.
-            // - So if volumedown is enough, just do nothing until it gets disabled by on_post_fs_data().
-            if (is_volumedown_enough(volumedown_pressed_count))
-                return 0;
-            // key pressed, count it
-            volumedown_pressed_count += 1;
-        }
-    }
+    if (static_branch_unlikely(&ksu_is_init_rc_hook_enabled))
+        ksu_install_rc_hook(file);
 
     return 0;
 }
 
-bool ksu_is_safe_mode()
+// ksud: safemode detection as a real input handler, replacing the input_event hook
+static bool safe_mode_flag = false;
+#define VOLUME_PRESS_THRESHOLD_COUNT 3
+
+static void vol_detector_event(struct input_handle *handle, unsigned int type, unsigned int code, int value)
 {
-    static bool safe_mode = false;
-    if (safe_mode) {
-        // don't need to check again, userspace may call multiple times
-        return true;
+    static int vol_up_cnt = 0;
+    static int vol_down_cnt = 0;
+
+    if (!value)
+        return;
+
+    if (type != EV_KEY)
+        return;
+
+    if (code == KEY_VOLUMEDOWN) {
+        vol_down_cnt++;
+        pr_info("KEY_VOLUMEDOWN press detected!\n");
     }
 
-    // stop hook first!
-    if (static_key_enabled(&ksu_is_input_hook_enabled)) {
-        static_branch_disable(&ksu_is_input_hook_enabled);
-        pr_info("ksu_input_hook is disabled\n");
+    if (code == KEY_VOLUMEUP) {
+        vol_up_cnt++;
+        pr_info("KEY_VOLUMEUP press detected!\n");
     }
 
-    pr_info("volumedown_pressed_count: %d\n", volumedown_pressed_count);
-    if (is_volumedown_enough(volumedown_pressed_count)) {
-        // pressed over 3 times
-        pr_info("KEY_VOLUMEDOWN pressed max times, safe mode detected!\n");
-        safe_mode = true;
-        return true;
-    }
+    pr_info("volume_pressed_count: vol_up: %d vol_down: %d\n", vol_up_cnt, vol_down_cnt);
 
-    return false;
+    /*
+     * Unregistering an input handler from inside the handler is not safe, and
+     * deferring it to a kthread causes issues too. Unregistration happens anyway
+     * from ksu_is_safe_mode() and on_post_fs_data(), so do not bother here.
+     */
+    if (vol_up_cnt >= VOLUME_PRESS_THRESHOLD_COUNT || vol_down_cnt >= VOLUME_PRESS_THRESHOLD_COUNT) {
+        pr_info("volume keys pressed max times, safe mode detected!\n");
+        safe_mode_flag = true;
+    }
 }
 
-void ksu_handle_vfs_fstat(int fd, loff_t *kstat_size_ptr)
+static int vol_detector_connect(struct input_handler *handler, struct input_dev *dev, const struct input_device_id *id)
 {
-    loff_t orig_size = *kstat_size_ptr;
-    size_t extra = 0;
-    bool is_rc = false;
-    struct file *file = fget(fd);
+    struct input_handle *handle;
+    int error;
 
+    handle = kzalloc(sizeof(struct input_handle), GFP_KERNEL);
+    if (!handle)
+        return -ENOMEM;
+
+    handle->dev = dev;
+    handle->handler = handler;
+    handle->name = "ksu_handle_input";
+
+    error = input_register_handle(handle);
+    if (error)
+        goto err_free_handle;
+
+    error = input_open_device(handle);
+    if (error)
+        goto err_unregister_handle;
+
+    return 0;
+
+err_unregister_handle:
+    input_unregister_handle(handle);
+err_free_handle:
+    kfree(handle);
+    return error;
+}
+
+static void vol_detector_disconnect(struct input_handle *handle)
+{
+    input_close_device(handle);
+    input_unregister_handle(handle);
+    kfree(handle);
+}
+
+static const struct input_device_id vol_detector_ids[] = {
+    // volume up is matched too so a broken volume down key can still reach safemode,
+    // and so ksu safemode can be tripped without tripping android's own safemode.
+    {
+        .flags = INPUT_DEVICE_ID_MATCH_EVBIT | INPUT_DEVICE_ID_MATCH_KEYBIT,
+        .evbit = { BIT_MASK(EV_KEY) },
+        .keybit = { [BIT_WORD(KEY_VOLUMEUP)] = BIT_MASK(KEY_VOLUMEUP) },
+    },
+    {
+        .flags = INPUT_DEVICE_ID_MATCH_EVBIT | INPUT_DEVICE_ID_MATCH_KEYBIT,
+        .evbit = { BIT_MASK(EV_KEY) },
+        .keybit = { [BIT_WORD(KEY_VOLUMEDOWN)] = BIT_MASK(KEY_VOLUMEDOWN) },
+    },
+    {}
+};
+
+static struct input_handler vol_detector_handler = {
+    .event = vol_detector_event,
+    .connect = vol_detector_connect,
+    .disconnect = vol_detector_disconnect,
+    .name = "ksu",
+    .id_table = vol_detector_ids,
+};
+
+static bool vol_detector_registered = false;
+
+void ksu_stop_input_hook(void)
+{
+    if (!vol_detector_registered)
+        return;
+
+    vol_detector_registered = false;
+    input_unregister_handler(&vol_detector_handler);
+    pr_info("ksu_input_hook is disabled\n");
+}
+
+bool ksu_is_safe_mode()
+{
+    // don't need to check again, userspace may call multiple times
+    static bool already_checked = false;
+
+    if (already_checked)
+        return true;
+
+    // stop hook first!
+    ksu_stop_input_hook();
+
+    if (!safe_mode_flag)
+        return false;
+
+    already_checked = true;
+    return true;
+}
+
+/*
+ * Android 16 (Canary 2601+) reads init.rc with libbase ReadFdToString, which trusts
+ * st_size from fstat. Without inflating it init never reads the injected rc.
+ * Hooked at sys_newfstat return, so no other vfs_fstat caller is affected.
+ */
+void ksu_handle_newfstat_ret(unsigned int *fd, struct stat __user **statbuf_ptr)
+{
+    void __user *st_size_ptr;
+    struct file *file;
+    bool is_rc = false;
+    long size, new_size;
+
+    if (unlikely(!fd || !statbuf_ptr || !*statbuf_ptr))
+        return;
+
+    if (likely(!static_branch_unlikely(&ksu_is_init_rc_hook_enabled)))
+        return;
+
+    file = fget(*fd);
     if (file) {
         if (is_init_rc(file)) {
             pr_info("stat init.rc");
@@ -541,21 +634,36 @@ void ksu_handle_vfs_fstat(int fd, loff_t *kstat_size_ptr)
         fput(file);
     }
 
-    if (is_rc) {
-        extra = ksu_rc_len + module_rc_len;
-        *kstat_size_ptr = orig_size + extra;
-        pr_info("adding rc len: %lld -> %lld (static=%zu module=%zu)", orig_size, *kstat_size_ptr, ksu_rc_len,
-                module_rc_len);
+    if (!is_rc)
+        return;
+
+    st_size_ptr = (void __user *)*statbuf_ptr + offsetof(struct stat, st_size);
+    if (copy_from_user_nofault(&size, st_size_ptr, sizeof(size))) {
+        pr_err("newfstat: read st_size failed\n");
+        return;
     }
+
+    new_size = size + ksu_rc_len + module_rc_len;
+    pr_info("adding rc len: %ld -> %ld (static=%zu module=%zu)\n", size, new_size, ksu_rc_len, module_rc_len);
+
+    if (copy_to_user_nofault(st_size_ptr, &new_size, sizeof(new_size)))
+        pr_err("newfstat: adding rc len failed\n");
 }
 
 // ksud: module support
 void __init ksu_ksud_init()
 {
+    if (input_register_handler(&vol_detector_handler)) {
+        pr_err("vol_detector: failed to register input handler\n");
+        return;
+    }
+
+    vol_detector_registered = true;
 }
 
 void __exit ksu_ksud_exit()
 {
+    ksu_stop_input_hook();
     if (module_rc_buf) {
         free_module_rc();
     }

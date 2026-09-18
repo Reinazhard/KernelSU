@@ -23,4 +23,10 @@ struct user_arg_ptr {
 
 int ksu_handle_execveat_ksud(int *fd, struct filename **filename_ptr, struct user_arg_ptr *argv,
                              struct user_arg_ptr *envp, int *flags);
+
+void ksu_handle_newfstat_ret(unsigned int *fd, struct stat __user **statbuf_ptr);
+
+void ksu_install_rc_hook(struct file *file);
+int ksu_file_permission(struct file *file, int mask);
+void ksu_stop_input_hook(void);
 #endif

@@ -76,8 +76,6 @@ static void __user *userspace_stack_buffer(const void *d, size_t len)
 
 static char __user *sh_user_path(void)
 {
-    static const char sh_path[] = "/system/bin/sh";
-
     return userspace_stack_buffer(sh_path, sizeof(sh_path));
 }
 
@@ -227,39 +225,57 @@ int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv, voi
     return ksu_handle_execveat_sucompat(fd, filename_ptr, argv, envp, flags);
 }
 
-int ksu_handle_faccessat(int *dfd, struct filename **filename, int *mode, int *__unused_flags)
+/*
+ * Scope-minimized sucompat: the hook sits at the syscall entry, so only the raw
+ * userspace pointer is available. Compare in kernel memory and, on a match, point
+ * the caller at a scratch copy of "/system/bin/sh" placed just below the user stack.
+ */
+static bool ksu_sucompat_redirect_user(const char __user **filename_user)
 {
-    if (unlikely(IS_ERR(*filename) || (*filename)->name == NULL))
-        return 0;
+    char path[sizeof(su_path) + 1];
+    const char __user *sh_user;
 
-    if (likely(memcmp((*filename)->name, su_path, sizeof(su_path))))
-        return 0;
+    if (unlikely(!filename_user || !*filename_user))
+        return false;
+
+    memset(path, 0, sizeof(path));
+    if (strncpy_from_user_nofault(path, *filename_user, sizeof(path)) < 0)
+        return false;
+
+    // compares against the trailing NUL too, so "/system/bin/suXYZ" never matches
+    if (likely(memcmp(path, su_path, sizeof(su_path))))
+        return false;
 
     if (current_chrooted()) {
-        pr_err(
-            "ksu_handle_faccessat: su found but NOT allowed! Because current process is running in chrooted environment\n");
-        return 0;
+        pr_err("sucompat: su found but NOT allowed! Because current process is running in chrooted environment\n");
+        return false;
     }
+
+    sh_user = sh_user_path();
+    if (unlikely(!sh_user)) {
+        pr_err("sucompat: failed to stage sh path for redirect\n");
+        return false;
+    }
+
+    *filename_user = sh_user;
+    return true;
+}
+
+int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode, int *__unused_flags)
+{
+    if (!ksu_sucompat_redirect_user(filename_user))
+        return 0;
+
     pr_info("ksu_handle_faccessat: su->sh!\n");
-    memcpy((void *)((*filename)->name), sh_path, sizeof(sh_path));
     return 0;
 }
 
-int ksu_handle_stat(int *dfd, struct filename **filename, int *flags)
+int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags)
 {
-    if (unlikely(IS_ERR(*filename) || (*filename)->name == NULL))
+    if (!ksu_sucompat_redirect_user(filename_user))
         return 0;
 
-    if (likely(memcmp((*filename)->name, su_path, sizeof(su_path))))
-        return 0;
-
-    if (current_chrooted()) {
-        pr_err(
-            "ksu_handle_stat: su found but NOT allowed! Because current process is running in chrooted environment\n");
-        return 0;
-    }
     pr_info("ksu_handle_stat: su->sh!\n");
-    memcpy((void *)((*filename)->name), sh_path, sizeof(sh_path));
     return 0;
 }
 
