@@ -44,7 +44,7 @@ static void reset_avc_cache()
 
 void apply_kernelsu_rules()
 {
-    struct selinux_policy *pol, *old_pol = selinux_state.policy;
+    struct selinux_policy *pol, *old_pol;
     struct policydb *db;
 
     if (!getenforce()) {
@@ -52,6 +52,14 @@ void apply_kernelsu_rules()
     }
 
     mutex_lock(&selinux_state.policy_mutex);
+    /*
+     * Sample the current policy under the mutex.  selinux_state.policy is
+     * replaced concurrently (another apply_kernelsu_rules(), handle_sepolicy()
+     * or security_load_policy()) and the old object is freed, so a pointer
+     * captured before the lock can be duped after it was freed and then freed
+     * a second time below.
+     */
+    old_pol = selinux_state.policy;
     backup_sepolicy =
         ksu_dup_sepolicy(rcu_dereference_protected(old_pol, lockdep_is_held(&selinux_state.policy_mutex)));
     if (IS_ERR(backup_sepolicy)) {
