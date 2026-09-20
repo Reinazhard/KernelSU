@@ -497,6 +497,24 @@ int ksu_install_file_wrapper(int fd)
         return -EBADF;
     }
 
+    /*
+     * ksu_wrapper_d_dname() resolves the original path with d_path(), and
+     * d_path() dispatches straight back into ->d_dname for a wrapper dentry
+     * (the wrapper's pseudo dentry is not the anon_inode mount root, so the
+     * "dentry != mnt_root" arm of d_path()'s guard is taken).  Wrapping a
+     * wrapper therefore recurses once per level, and the caller chooses how
+     * many levels to build: each successful GET_WRAPPER_FD on the previous
+     * result nests one deeper.  A readlink() of the outermost fd then walks
+     * the whole chain on the kernel stack.
+     *
+     * A wrapper already reports the original path, so nesting buys nothing.
+     * Refuse it and keep the depth at one.
+     */
+    if (orig_file->f_path.dentry->d_op == &ksu_file_wrapper_d_ops) {
+        ret = -EINVAL;
+        goto done;
+    }
+
     out_fd = get_unused_fd_flags(O_CLOEXEC);
     if (out_fd < 0) {
         ret = out_fd;
