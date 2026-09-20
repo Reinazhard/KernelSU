@@ -106,7 +106,7 @@ static __u32 ksu_sulog_copy_empty_string(char *dst)
 
 static __u32 ksu_sulog_copy_filename_kernel(const char *filename, char *dst, __u32 dst_len)
 {
-    long ret;
+    ssize_t ret;
 
     if (!dst_len)
         return 0;
@@ -114,12 +114,15 @@ static __u32 ksu_sulog_copy_filename_kernel(const char *filename, char *dst, __u
     if (!filename)
         return ksu_sulog_copy_empty_string(dst);
 
-    ret = strncpy(dst, filename, dst_len);
-    if (ret <= 0)
-        return ksu_sulog_copy_empty_string(dst);
-
-    if (ret >= dst_len) {
-        dst[dst_len - 1] = '\0';
+    /*
+     * strncpy() returns a pointer, not a length.  Storing it in a signed
+     * integer makes every kernel address negative, so the previous
+     * `ret <= 0` test was always true and every kernel-side filename was
+     * logged as the empty string.
+     */
+    ret = strscpy(dst, filename, dst_len);
+    if (ret < 0) {
+        /* Truncated; strscpy() still NUL-terminated the buffer. */
         return dst_len;
     }
 
