@@ -329,18 +329,25 @@ static int do_get_app_profile(void __user *arg)
 
     rcu_read_lock();
     profile = ksu_get_app_profile(uid);
-    if (!profile) {
-        rcu_read_unlock();
-        ret = -ENOENT;
-    } else {
-        if (copy_to_user((char __user *)arg + offsetof(struct ksu_get_app_profile_cmd, profile), profile,
-                         sizeof(struct app_profile))) {
-            pr_err("get_app_profile: copy_to_user failed\n");
-            ret = -EFAULT;
-        }
-        rcu_read_unlock();
-        ksu_put_app_profile(profile);
+    rcu_read_unlock();
+
+    if (!profile)
+        return -ENOENT;
+
+    /*
+     * The reference taken by ksu_get_app_profile() keeps the profile alive, so
+     * the copy can happen outside the RCU read-side section: copy_to_user()
+     * may fault and sleep (page-in, swap, userfaultfd), and with preempt RCU a
+     * reader that blocks never reports a quiescent state - every grace period
+     * in the system stalls with it.
+     */
+    if (copy_to_user((char __user *)arg + offsetof(struct ksu_get_app_profile_cmd, profile), profile,
+                     sizeof(struct app_profile))) {
+        pr_err("get_app_profile: copy_to_user failed\n");
+        ret = -EFAULT;
     }
+    ksu_put_app_profile(profile);
+
     return ret;
 }
 
